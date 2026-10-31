@@ -317,36 +317,32 @@ def axis_prominent_extrema_indices(
     *,
     closed: bool = True,
 ) -> list[int]:
+    values = np.ascontiguousarray(values)
     n = values.shape[0]
     if n < 3:
         return list(range(n))
 
     radius = max(1, min(radius, max(1, n // 4)))
-    indices: list[int] = []
-    for i in range(n):
-        if closed:
-            neighbor_ix = [((i + off) % n) for off in range(-radius, radius + 1)]
-            local = values[neighbor_ix]
-        else:
-            lo = max(0, i - radius)
-            hi = min(n - 1, i + radius)
-            local = values[lo : hi + 1]
-
-        v = values[i]
-        local_min = float(np.min(local))
-        local_max = float(np.max(local))
-        is_local_max = np.all(v >= local)
-        is_local_min = np.all(v <= local)
-        if is_local_max:
-            prominence = v - local_min
-        elif is_local_min:
-            prominence = local_max - v
-        else:
-            prominence = 0.0
-
-        if (is_local_max or is_local_min) and prominence >= min_prominence:
-            indices.append(i)
-    return indices
+    width = 2 * radius + 1
+    if closed:
+        padded = np.concatenate((values[-radius:], values, values[:radius]))
+    else:
+        # Repeat the endpoint. The truncated window already contains it, so min/max stay the same.
+        padded = np.concatenate((
+            np.repeat(values[0], radius),
+            values,
+            np.repeat(values[-1], radius),
+        ))
+    windows = np.lib.stride_tricks.sliding_window_view(padded, width)
+    is_local_max = np.all(windows <= values[:, None], axis=1)
+    is_local_min = np.all(windows >= values[:, None], axis=1)
+    prominence = np.where(
+        is_local_max,
+        values - windows.min(axis=1),
+        np.where(is_local_min, windows.max(axis=1) - values, 0.0),
+    )
+    keep = (is_local_max | is_local_min) & (prominence >= min_prominence)
+    return np.flatnonzero(keep).tolist()
 
 
 def is_basically_a_line(
@@ -365,10 +361,9 @@ def is_basically_a_line(
     if norm <= 1e-9:
         return True
     unit_vec = vec / norm
-
-    for i in range(1, contour.shape[0] - 1):
-        point_vec = contour[i] - start
-        point_dist = abs(point_vec[0] * unit_vec[1] - point_vec[1] * unit_vec[0])
-        if point_dist > pixel_tolerance:
-            return False
-    return True
+    mid = contour[1:-1]
+    if mid.shape[0] == 0:
+        return True
+    rel = mid - start
+    point_dist = np.abs(rel[:, 0] * unit_vec[1] - rel[:, 1] * unit_vec[0])
+    return bool(np.all(point_dist <= pixel_tolerance))

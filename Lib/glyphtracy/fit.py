@@ -71,6 +71,34 @@ def _chord_t_values(points_xy: np.ndarray) -> np.ndarray:
     return (cumulative / total).astype(np.float64)
 
 
+def _interior_basis(points_xy: np.ndarray):
+    t = _chord_t_values(points_xy)[1:-1]
+    if t.size == 0:
+        return None
+    mt = 1.0 - t
+    return (
+        points_xy[1:-1],
+        mt**3,
+        3.0 * (mt**2) * t,
+        3.0 * mt * (t**2),
+        t**3,
+    )
+
+
+def _stack_system(sample_a, sample_b, extra_a: list[np.ndarray], extra_b: list[float]):
+    blocks_a = []
+    blocks_b = []
+    if sample_a is not None:
+        blocks_a.append(sample_a)
+        blocks_b.append(sample_b)
+    if extra_a:
+        blocks_a.append(np.stack(extra_a, axis=0))
+        blocks_b.append(np.asarray(extra_b, dtype=np.float64))
+    if not blocks_a:
+        return None
+    return np.vstack(blocks_a), np.concatenate(blocks_b)
+
+
 def _fit_single_cubic_with_tangents(
     points_xy: np.ndarray,
     tan_start: np.ndarray,
@@ -83,46 +111,45 @@ def _fit_single_cubic_with_tangents(
     p3 = points_xy[-1]
     t0 = _unit(tan_start)
     t3 = _unit(tan_end)
-    t_values = _chord_t_values(points_xy)
-
-    a_rows: list[np.ndarray] = []
-    b_rows: list[float] = []
-
     # Unknowns are handle lengths alpha (start) and beta (end):
     # p1 = p0 + alpha * t0
     # p2 = p3 - beta  * t3
-    for ti, q in zip(t_values[1:-1], points_xy[1:-1]):
-        mt = 1.0 - ti
-        b1 = 3.0 * (mt**2) * ti
-        b2 = 3.0 * mt * (ti**2)
-        const = (mt**3 + b1) * p0 + (ti**3 + b2) * p3
-        rhs = q - const
+    basis = _interior_basis(points_xy)
+    sample_a = None
+    sample_b = None
+    if basis is not None:
+        q, b0, b1, b2, b3 = basis
+        rhs = q - ((b0 + b1)[:, None] * p0 + (b3 + b2)[:, None] * p3)
+        n = q.shape[0]
+        sample_a = np.empty((2 * n, 2), dtype=np.float64)
+        sample_b = np.empty(2 * n, dtype=np.float64)
+        sample_a[0::2, 0] = b1 * t0[0]
+        sample_a[0::2, 1] = -b2 * t3[0]
+        sample_a[1::2, 0] = b1 * t0[1]
+        sample_a[1::2, 1] = -b2 * t3[1]
+        sample_b[0::2] = rhs[:, 0]
+        sample_b[1::2] = rhs[:, 1]
 
-        row_x = np.array([b1 * t0[0], -b2 * t3[0]], dtype=np.float64)
-        row_y = np.array([b1 * t0[1], -b2 * t3[1]], dtype=np.float64)
-        a_rows.append(row_x)
-        b_rows.append(float(rhs[0]))
-        a_rows.append(row_y)
-        b_rows.append(float(rhs[1]))
-
+    extra_a: list[np.ndarray] = []
+    extra_b: list[float] = []
     if segment_balance_weight > 0.0:
         w = float(np.sqrt(segment_balance_weight))
-        a_rows.append(np.array([w, -w], dtype=np.float64))
-        b_rows.append(0.0)
+        extra_a.append(np.array([w, -w], dtype=np.float64))
+        extra_b.append(0.0)
 
     if handle_shrink_weight > 0.0:
         w = float(np.sqrt(handle_shrink_weight))
-        a_rows.append(np.array([w, 0.0], dtype=np.float64))
-        b_rows.append(0.0)
-        a_rows.append(np.array([0.0, w], dtype=np.float64))
-        b_rows.append(0.0)
+        extra_a.append(np.array([w, 0.0], dtype=np.float64))
+        extra_b.append(0.0)
+        extra_a.append(np.array([0.0, w], dtype=np.float64))
+        extra_b.append(0.0)
 
-    if not a_rows:
+    system = _stack_system(sample_a, sample_b, extra_a, extra_b)
+    if system is None:
         alpha = 0.0
         beta = 0.0
     else:
-        a = np.vstack(a_rows)
-        b = np.asarray(b_rows, dtype=np.float64)
+        a, b = system
         x, *_ = np.linalg.lstsq(a, b, rcond=None)
         alpha = max(0.0, float(x[0]))
         beta = max(0.0, float(x[1]))
@@ -156,7 +183,6 @@ def _fit_single_cubic_with_partial_constraints(
     p3 = points_xy[-1]
     t0 = _unit(tan_start)
     t3 = _unit(tan_end)
-    t_values = _chord_t_values(points_xy)
 
     next_var = 0
     i_alpha = None
@@ -183,47 +209,39 @@ def _fit_single_cubic_with_partial_constraints(
         next_var += 1
 
     n_vars = next_var
-    a_rows: list[np.ndarray] = []
-    b_rows: list[float] = []
-
-    for ti, q in zip(t_values[1:-1], points_xy[1:-1]):
-        mt = 1.0 - ti
-        b0 = mt**3
-        b1 = 3.0 * (mt**2) * ti
-        b2 = 3.0 * mt * (ti**2)
-        b3 = ti**3
-        # Include endpoint contributions from constrained handles:
-        # c1 = p0 + alpha*t0  =>  b1*c1 = b1*p0 + b1*alpha*t0  =>  b1*p0 is constant
-        # c2 = p3 - beta *t3  =>  b2*c2 = b2*p3 - b2*beta *t3  =>  b2*p3 is constant
-        const = b0 * p0 + b3 * p3
+    basis = _interior_basis(points_xy)
+    sample_a = None
+    sample_b = None
+    if basis is not None:
+        q, b0, b1, b2, b3 = basis
+        # c1 = p0 + alpha*t0  =>  b1*c1 contributes b1*p0 when alpha is the unknown.
+        # c2 = p3 - beta *t3  =>  b2*c2 contributes b2*p3 when beta is the unknown.
+        const = b0[:, None] * p0 + b3[:, None] * p3
         if not free_start_handle:
-            const = const + b1 * p0
+            const = const + b1[:, None] * p0
         if not free_end_handle:
-            const = const + b2 * p3
+            const = const + b2[:, None] * p3
         rhs = q - const
-
-        row_x = np.zeros(n_vars, dtype=np.float64)
-        row_y = np.zeros(n_vars, dtype=np.float64)
-
+        n = q.shape[0]
+        sample_a = np.zeros((2 * n, n_vars), dtype=np.float64)
+        sample_b = np.empty(2 * n, dtype=np.float64)
         if free_start_handle:
-            row_x[i_c1x] = b1
-            row_y[i_c1y] = b1
+            sample_a[0::2, i_c1x] = b1
+            sample_a[1::2, i_c1y] = b1
         else:
-            row_x[i_alpha] = b1 * t0[0]
-            row_y[i_alpha] = b1 * t0[1]
-
+            sample_a[0::2, i_alpha] = b1 * t0[0]
+            sample_a[1::2, i_alpha] = b1 * t0[1]
         if free_end_handle:
-            row_x[i_c2x] = b2
-            row_y[i_c2y] = b2
+            sample_a[0::2, i_c2x] = b2
+            sample_a[1::2, i_c2y] = b2
         else:
-            row_x[i_beta] = -b2 * t3[0]
-            row_y[i_beta] = -b2 * t3[1]
+            sample_a[0::2, i_beta] = -b2 * t3[0]
+            sample_a[1::2, i_beta] = -b2 * t3[1]
+        sample_b[0::2] = rhs[:, 0]
+        sample_b[1::2] = rhs[:, 1]
 
-        a_rows.append(row_x)
-        b_rows.append(float(rhs[0]))
-        a_rows.append(row_y)
-        b_rows.append(float(rhs[1]))
-
+    extra_a: list[np.ndarray] = []
+    extra_b: list[float] = []
     if (
         segment_balance_weight > 0.0
         and (not free_start_handle)
@@ -233,47 +251,47 @@ def _fit_single_cubic_with_partial_constraints(
         row = np.zeros(n_vars, dtype=np.float64)
         row[i_alpha] = w
         row[i_beta] = -w
-        a_rows.append(row)
-        b_rows.append(0.0)
+        extra_a.append(row)
+        extra_b.append(0.0)
 
     if handle_shrink_weight > 0.0:
         w = float(np.sqrt(handle_shrink_weight))
         if free_start_handle:
             row = np.zeros(n_vars, dtype=np.float64)
             row[i_c1x] = w
-            a_rows.append(row)
-            b_rows.append(w * float(p0[0]))
+            extra_a.append(row)
+            extra_b.append(w * float(p0[0]))
             row = np.zeros(n_vars, dtype=np.float64)
             row[i_c1y] = w
-            a_rows.append(row)
-            b_rows.append(w * float(p0[1]))
+            extra_a.append(row)
+            extra_b.append(w * float(p0[1]))
         else:
             row = np.zeros(n_vars, dtype=np.float64)
             row[i_alpha] = w
-            a_rows.append(row)
-            b_rows.append(0.0)
+            extra_a.append(row)
+            extra_b.append(0.0)
 
         if free_end_handle:
             row = np.zeros(n_vars, dtype=np.float64)
             row[i_c2x] = w
-            a_rows.append(row)
-            b_rows.append(w * float(p3[0]))
+            extra_a.append(row)
+            extra_b.append(w * float(p3[0]))
             row = np.zeros(n_vars, dtype=np.float64)
             row[i_c2y] = w
-            a_rows.append(row)
-            b_rows.append(w * float(p3[1]))
+            extra_a.append(row)
+            extra_b.append(w * float(p3[1]))
         else:
             row = np.zeros(n_vars, dtype=np.float64)
             row[i_beta] = w
-            a_rows.append(row)
-            b_rows.append(0.0)
+            extra_a.append(row)
+            extra_b.append(0.0)
 
-    if not a_rows:
+    system = _stack_system(sample_a, sample_b, extra_a, extra_b)
+    if system is None:
         c1 = p0.copy()
         c2 = p3.copy()
     else:
-        a = np.vstack(a_rows)
-        b = np.asarray(b_rows, dtype=np.float64)
+        a, b = system
         x, *_ = np.linalg.lstsq(a, b, rcond=None)
 
         if free_start_handle:
@@ -313,16 +331,23 @@ def _fit_single_cubic_unconstrained(
 
 
 def _segment_max_error(cubic: CubicBez, points_xy: np.ndarray) -> tuple[float, int]:
-    t_values = _chord_t_values(points_xy)
-    max_error = 0.0
-    max_index = 0
-    for i, (ti, q) in enumerate(zip(t_values, points_xy)):
-        p: Point = cubic.eval(float(ti))
-        err = p.distance(Point(q[0], q[1]))
-        if err > max_error:
-            max_error = err
-            max_index = i
-    return max_error, max_index
+    n = points_xy.shape[0]
+    if n == 0:
+        return 0.0, 0
+    t = _chord_t_values(points_xy)[:n]
+    mt = 1.0 - t
+    b0 = mt**3
+    b1 = 3.0 * (mt**2) * t
+    b2 = 3.0 * mt * (t**2)
+    b3 = t**3
+    p0 = np.array([float(cubic.p0.x), float(cubic.p0.y)], dtype=np.float64)
+    p1 = np.array([float(cubic.p1.x), float(cubic.p1.y)], dtype=np.float64)
+    p2 = np.array([float(cubic.p2.x), float(cubic.p2.y)], dtype=np.float64)
+    p3 = np.array([float(cubic.p3.x), float(cubic.p3.y)], dtype=np.float64)
+    pts = b0[:, None] * p0 + b1[:, None] * p1 + b2[:, None] * p2 + b3[:, None] * p3
+    err = np.hypot(pts[:, 0] - points_xy[:, 0], pts[:, 1] - points_xy[:, 1])
+    max_index = int(np.argmax(err))
+    return float(err[max_index]), max_index
 
 
 def _split_and_refit(
@@ -418,80 +443,79 @@ def _global_handle_lengths(
     out_off = 0
     in_off = n_nodes
 
-    rows: list[np.ndarray] = []
-    rhs: list[float] = []
+    blocks_a: list[np.ndarray] = []
+    blocks_b: list[np.ndarray] = []
 
     for si, points_xy in enumerate(segment_points_xy):
         if points_xy.shape[0] < 3:
             continue
+        basis = _interior_basis(points_xy)
+        if basis is None:
+            continue
+        q, b0, b1, b2, b3 = basis
         p0 = node_points_xy[si]
         p3 = node_points_xy[si + 1]
         t0 = node_tangents[si]
         t3 = node_tangents[si + 1]
-        t_values = _chord_t_values(points_xy)
-
-        for ti, q in zip(t_values[1:-1], points_xy[1:-1]):
-            mt = 1.0 - ti
-            b1 = 3.0 * (mt**2) * ti
-            b2 = 3.0 * mt * (ti**2)
-            const = (mt**3 + b1) * p0 + (ti**3 + b2) * p3
-            target = q - const
-
-            row_x = np.zeros(n_vars, dtype=np.float64)
-            row_y = np.zeros(n_vars, dtype=np.float64)
-            row_x[out_off + si] = b1 * t0[0]
-            row_y[out_off + si] = b1 * t0[1]
-            row_x[in_off + si + 1] = -b2 * t3[0]
-            row_y[in_off + si + 1] = -b2 * t3[1]
-            rows.append(row_x)
-            rhs.append(float(target[0]))
-            rows.append(row_y)
-            rhs.append(float(target[1]))
+        target = q - ((b0 + b1)[:, None] * p0 + (b3 + b2)[:, None] * p3)
+        n = q.shape[0]
+        block = np.zeros((2 * n, n_vars), dtype=np.float64)
+        rhs_block = np.empty(2 * n, dtype=np.float64)
+        block[0::2, out_off + si] = b1 * t0[0]
+        block[1::2, out_off + si] = b1 * t0[1]
+        block[0::2, in_off + si + 1] = -b2 * t3[0]
+        block[1::2, in_off + si + 1] = -b2 * t3[1]
+        rhs_block[0::2] = target[:, 0]
+        rhs_block[1::2] = target[:, 1]
+        blocks_a.append(block)
+        blocks_b.append(rhs_block)
 
     if segment_balance_weight > 0.0:
         w = float(np.sqrt(segment_balance_weight))
-        for si in range(n_nodes - 1):
-            row = np.zeros(n_vars, dtype=np.float64)
-            row[out_off + si] = w
-            row[in_off + si + 1] = -w
-            rows.append(row)
-            rhs.append(0.0)
+        m = n_nodes - 1
+        block = np.zeros((m, n_vars), dtype=np.float64)
+        si = np.arange(m)
+        block[si, out_off + si] = w
+        block[si, in_off + si + 1] = -w
+        blocks_a.append(block)
+        blocks_b.append(np.zeros(m, dtype=np.float64))
 
-    if node_balance_weight > 0.0:
+    if node_balance_weight > 0.0 and n_nodes > 2:
         w = float(np.sqrt(node_balance_weight))
-        for ni in range(1, n_nodes - 1):
-            row = np.zeros(n_vars, dtype=np.float64)
-            row[in_off + ni] = w
-            row[out_off + ni] = -w
-            rows.append(row)
-            rhs.append(0.0)
+        ni = np.arange(1, n_nodes - 1)
+        block = np.zeros((ni.shape[0], n_vars), dtype=np.float64)
+        row = np.arange(ni.shape[0])
+        block[row, in_off + ni] = w
+        block[row, out_off + ni] = -w
+        blocks_a.append(block)
+        blocks_b.append(np.zeros(ni.shape[0], dtype=np.float64))
 
     if g2_weight > 0.0:
         w = float(np.sqrt(g2_weight))
-        for ni in range(1, n_nodes - 1):
-            if continuities[ni] != "G2":
-                continue
-            row = np.zeros(n_vars, dtype=np.float64)
-            row[in_off + ni] = w
-            row[out_off + ni] = -w
-            rows.append(row)
-            rhs.append(0.0)
+        ni = np.array(
+            [i for i in range(1, n_nodes - 1) if continuities[i] == "G2"],
+            dtype=np.int64,
+        )
+        if ni.size:
+            block = np.zeros((ni.shape[0], n_vars), dtype=np.float64)
+            row = np.arange(ni.shape[0])
+            block[row, in_off + ni] = w
+            block[row, out_off + ni] = -w
+            blocks_a.append(block)
+            blocks_b.append(np.zeros(ni.shape[0], dtype=np.float64))
 
     if handle_shrink_weight > 0.0:
         w = float(np.sqrt(handle_shrink_weight))
-        for vi in range(n_vars):
-            row = np.zeros(n_vars, dtype=np.float64)
-            row[vi] = w
-            rows.append(row)
-            rhs.append(0.0)
+        blocks_a.append(np.eye(n_vars, dtype=np.float64) * w)
+        blocks_b.append(np.zeros(n_vars, dtype=np.float64))
 
-    if not rows:
+    if not blocks_a:
         out_len = np.zeros(n_nodes, dtype=np.float64)
         in_len = np.zeros(n_nodes, dtype=np.float64)
         return out_len, in_len
 
-    a = np.vstack(rows)
-    b = np.asarray(rhs, dtype=np.float64)
+    a = np.vstack(blocks_a)
+    b = np.concatenate(blocks_b)
     x, *_ = np.linalg.lstsq(a, b, rcond=None)
     out_len = np.maximum(0.0, x[out_off : out_off + n_nodes])
     in_len = np.maximum(0.0, x[in_off : in_off + n_nodes])

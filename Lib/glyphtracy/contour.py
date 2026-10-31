@@ -108,6 +108,43 @@ class Contour:
         dot = max(-1.0, min(1.0, dot))
         return float(math.acos(dot))
 
+    def corner_angles(self, stride: int = 1) -> np.ndarray:
+        points = self.points_rc
+        n = int(points.shape[0])
+        if n < 3:
+            return np.zeros(n, dtype=np.float64)
+        stride = int(stride)
+        degenerate = None
+        if self.closed:
+            if stride % n == 0:
+                return np.zeros(n, dtype=np.float64)
+            prev = np.roll(points, stride, axis=0)
+            nxt = np.roll(points, -stride, axis=0)
+        else:
+            idx = np.arange(n)
+            prev_i = np.maximum(0, idx - stride)
+            next_i = np.minimum(n - 1, idx + stride)
+            prev = points[prev_i]
+            nxt = points[next_i]
+            degenerate = (prev_i == idx) | (next_i == idx)
+        v_in = points - prev
+        v_out = nxt - points
+        n_in = np.linalg.norm(v_in, axis=1)
+        n_out = np.linalg.norm(v_out, axis=1)
+        u_in = np.empty((n, 2), dtype=np.float64)
+        u_out = np.empty((n, 2), dtype=np.float64)
+        ok_in = n_in > 1e-9
+        ok_out = n_out > 1e-9
+        u_in[ok_in] = v_in[ok_in] / n_in[ok_in, None]
+        u_out[ok_out] = v_out[ok_out] / n_out[ok_out, None]
+        u_in[~ok_in] = (1.0, 0.0)
+        u_out[~ok_out] = (1.0, 0.0)
+        dot = np.clip(np.sum(u_in * u_out, axis=1), -1.0, 1.0)
+        angles = np.arccos(dot)
+        if degenerate is not None:
+            angles[degenerate] = 0.0
+        return angles
+
     def iterative_axis_extrema_axes(
         self,
         *,

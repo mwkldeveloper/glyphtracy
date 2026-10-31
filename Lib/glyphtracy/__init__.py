@@ -282,10 +282,11 @@ class Vectorizer:
         axis_extrema: dict[int, set[AxisExtremaTag]] = {}
 
         sharp_corner_indices: set[int] = set()
-        for i in range(n):
-            if contour.corner_angle(i, stride=1) >= self.sharp_threshold:
-                sharp_corner_indices.add(i)
-                candidates.setdefault(i, set()).add("sharp_corner")
+        angles = contour.corner_angles(stride=1)
+        for i in np.flatnonzero(angles >= self.sharp_threshold):
+            i = int(i)
+            sharp_corner_indices.add(i)
+            candidates.setdefault(i, set()).add("sharp_corner")
 
         axis_map: dict[int, set[AxisExtremaTag]] = {}
         if len(sharp_corner_indices) >= 2:
