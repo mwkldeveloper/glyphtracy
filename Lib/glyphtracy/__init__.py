@@ -257,14 +257,20 @@ class Vectorizer:
 
     def extract_contours(self) -> list[Contour]:
         """Extract contours from image using skimage (or numpy-only fallback)."""
+        # Ink that touches the border is an open contour. Closing it with a
+        # straight chord cuts across the glyph. Pad background so it closes
+        # just outside the image, then shift coordinates back.
+        padded = np.pad(self.image_array, 1, mode="constant", constant_values=0)
         contours: list[Contour] = []
         for contour_id, contour in enumerate(
-            find_contours(self.image_array, level=self.contour_level)
+            find_contours(padded, level=self.contour_level)
         ):
             rc = dedupe_closed_contour(np.asarray(contour, dtype=np.float64))
             if rc.shape[0] < 3:
                 continue
-            contours.append(Contour(contour_id=contour_id, points_rc=rc, closed=True))
+            contours.append(
+                Contour(contour_id=contour_id, points_rc=rc - 1.0, closed=True)
+            )
         return contours
 
     def identify_nodes(
