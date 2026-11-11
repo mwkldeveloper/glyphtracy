@@ -15,7 +15,7 @@ description = "A tool to convert raster images of glyphs into vector paths using
 readme = "README.md"
 authors = [{ name = "Simon Cozens", email = "simon@simon-cozens.org" }]
 dynamic = ["version"]
-dependencies = ["numpy", "Pillow"]
+dependencies = ["numpy", "Pillow", "kurbopy", "scikit-image"]
 license = "Apache-2.0"
 license-files = ["LICENSE.txt"]
 
